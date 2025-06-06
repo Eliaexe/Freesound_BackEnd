@@ -22,7 +22,7 @@ const port = 5501;
 
 // Middleware
 app.use(cors({
-    origin: ['http://localhost:3000', 'http://localhost:5502'],
+    origin: ['http://localhost:3000', 'http://localhost:5502', 'https://freesound-front-end-git-main-paradis.vercel.app/', 'https://freesound-front-end-git-main-paradis.trycloudflare.com/', 'https://totalwebhub.com/'],
     credentials: true
 }));
 app.use(express.json());
