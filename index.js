@@ -22,7 +22,12 @@ const port = 5501;
 
 // Middleware
 app.use(cors({
-    origin: ['http://localhost:3000', 'http://localhost:5502', 'https://freesound-front-end-git-main-paradis.vercel.app/', 'https://freesound-front-end-git-main-paradis.trycloudflare.com/', 'https://totalwebhub.com/'],
+    origin: ['http://localhost:3000', 
+    'http://127.0.0.1:3000', 
+    'http://localhost:5502', 
+    'https://freesound-front-end-git-main-paradis.vercel.app/', 
+    'https://freesound-front-end-git-main-paradis.trycloudflare.com/', 
+    'https://totalwebhub.com/'],
     credentials: true
 }));
 app.use(express.json());
@@ -45,9 +50,10 @@ app.use(session({
     resave: false,
     saveUninitialized: false,
     cookie: {
-        secure: true, // true in produzione
+        secure: process.env.NODE_ENV === 'production', // solo HTTPS in produzione
         httpOnly: true,
-        maxAge: 24 * 60 * 60 * 1000 // 1 giorno in millisecondi
+        maxAge: 24 * 60 * 60 * 1000, // 1 giorno in millisecondi
+        sameSite: 'lax' // permette cross-origin per localhost
     }
 }));
 
@@ -62,6 +68,51 @@ if (!fs.existsSync(DOWNLOADS_DIR)){
 
 // === NUOVI ENDPOINT PER AUTENTICAZIONE SPOTIFY ===
 const STATE_KEY = 'spotify_auth_state';
+
+// Endpoint per ottenere l'URL di login
+app.get('/auth/url', (req, res) => {
+    const state = crypto.randomBytes(16).toString('hex');
+    
+    const level = req.query.level || 'basic';
+
+    const scopes = {
+        basic: [
+            'user-read-private',
+            'user-read-email',
+            'user-library-read',
+            'user-top-read',
+            'playlist-read-private',
+            'playlist-read-collaborative'
+        ],
+        crud: [
+            'playlist-modify-public',
+            'playlist-modify-private',
+            'user-library-modify'
+        ]
+    };
+
+    let scope;
+    if (level === 'crud') {
+        scope = [...new Set([...scopes.basic, ...scopes.crud])].join(' ');
+    } else {
+        scope = scopes.basic.join(' ');
+    }
+    
+    const authUrl = 'https://accounts.spotify.com/authorize?' +
+        new URLSearchParams({
+            response_type: 'code',
+            client_id: process.env.SPOTIFY_CLIENT_ID,
+            scope: scope,
+            redirect_uri: `http://127.0.0.1:5501/auth/callback`,
+            state: state
+        }).toString();
+    
+    // Salva lo state per la verifica successiva
+    res.cookie(STATE_KEY, state, { httpOnly: true });
+    
+    console.log('URL di autorizzazione richiesto:', authUrl);
+    res.json({ url: authUrl });
+});
 
 app.get('/auth/login', (req, res) => {
     const state = crypto.randomBytes(16).toString('hex');
@@ -127,14 +178,57 @@ app.get('/auth/callback', async (req, res) => {
     try {
         const tokenData = await spotifyAPI.exchangeCodeForTokens(code);
         
-        await spotifyAPI.setUserTokens(req.sessionID, tokenData);
+        await spotifyAPI.setUserTokens(req.session, tokenData);
 
         console.log('Token ottenuti e salvati in sessione per sessionID:', req.sessionID.substring(0,5) + '...');
         
-        res.redirect('http://localhost:3000/');
+        res.redirect('http://127.0.0.1:3000/auth/callback');
     } catch (error) {
         console.error('Errore durante lo scambio del codice o salvataggio token:', error.message, error.response?.data);
         res.status(500).send('Errore durante l\'autenticazione con Spotify.');
+    }
+});
+
+// Nuovo endpoint per lo scambio del codice dal frontend
+app.post('/auth/exchange', async (req, res) => {
+    try {
+        const { code, state } = req.body;
+        
+        if (!code || !state) {
+            return res.status(400).json({ success: false, error: 'Codice e state richiesti' });
+        }
+
+        console.log('Richiesta scambio codice ricevuta dal frontend');
+        console.log('Code:', code ? 'Presente' : 'Mancante');
+        console.log('State:', state ? state.substring(0,10) + '...' : 'Mancante');
+
+        // Scambia il codice per i token
+        const tokenData = await spotifyAPI.exchangeCodeForTokens(code);
+        
+        // Salva i token nella sessione
+        await spotifyAPI.setUserTokens(req.session, tokenData);
+
+        console.log('Token ottenuti e salvati in sessione per sessionID:', req.sessionID.substring(0,5) + '...');
+        
+        // Recupera i dati utente
+        const userData = await spotifyAPI.getUserProfile(req.session);
+        
+        if (!userData) {
+            return res.status(404).json({ success: false, error: 'Impossibile recuperare profilo utente' });
+        }
+
+        res.json({ 
+            success: true, 
+            user: {
+                display_name: userData.display_name,
+                email: userData.email,
+                id: userData.id,
+                images: userData.images || []
+            }
+        });
+    } catch (error) {
+        console.error('Errore scambio codice:', error.message, error.response?.data);
+        res.status(500).json({ success: false, error: 'Errore durante lo scambio del codice' });
     }
 });
 
@@ -145,7 +239,6 @@ app.get('/auth/logout', (req, res) => {
             console.error("Errore durante la distruzione della sessione:", err);
             return res.status(500).send('Impossibile effettuare il logout');
         }
-        spotifyAPI.clearUserTokens(sessionId);
         res.clearCookie('connect.sid');
         console.log('Utente sloggato, sessione distrutta per sessionID:', sessionId.substring(0,5) + '...');
         res.status(200).send('Logout effettuato con successo');
@@ -153,10 +246,10 @@ app.get('/auth/logout', (req, res) => {
 });
 
 app.get('/auth/status', async (req, res) => {
-    const tokens = await spotifyAPI.getUserTokens(req.sessionID);
-    if (tokens && tokens.access_token) {
+    const tokens = await spotifyAPI.getUserTokens(req.session);
+    if (tokens && tokens.accessToken) {
         try {
-            const userData = await spotifyAPI.getUserProfile(req.sessionID);
+            const userData = await spotifyAPI.getUserProfile(req.session);
              if (userData) {
                 res.json({ isAuthenticated: true, user: { displayName: userData.display_name, email: userData.email, id: userData.id } });
             } else {
@@ -185,14 +278,15 @@ app.post('/search', async (req, res) => {
         const decodedQuery = decodeURIComponent(query);
         
         // Usa la nuova ricerca multi-tipo
-        const searchResult = await spotifyAPI.searchMultiType(decodedQuery, 20);
+        const searchResult = await spotifyAPI.searchTrack(decodedQuery, 20);
         
         if (!searchResult.success) {
             return res.status(404).json({ error: searchResult.message || 'Nessun risultato trovato' });
         }
 
         // Mantiene compatibilità con il frontend esistente fornendo anche solo le tracce
-        const tracksOnly = searchResult.by_type.tracks;
+        // console.log('searchResult', searchResult);
+        const tracksOnly = searchResult.tracks;
 
         res.json({
             // Nuova struttura con tutti i tipi
@@ -366,12 +460,12 @@ app.get('/api/me/playlists', async (req, res) => {
     //     return res.status(401).json({ error: 'Utente non autenticato o token mancante.' });
     // }
     try {
-        const playlists = await spotifyAPI.getUserPlaylists(req.sessionID);
+        const playlists = await spotifyAPI.getUserPlaylists(req.session);
         res.json(playlists);
     } catch (error) {
         console.error('Errore nel recuperare le playlist dell\'utente:', error.message, error.response?.data);
         if (error.response?.status === 401) {
-             spotifyAPI.clearUserTokens(req.sessionID);
+             delete req.session.tokens;
              return res.status(401).json({ error: 'Token Spotify non valido o scaduto. Riprova l\'autenticazione.' });
         }
         res.status(error.response?.status || 500).json({ error: 'Errore interno del server nel recuperare le playlist.' });
@@ -380,7 +474,7 @@ app.get('/api/me/playlists', async (req, res) => {
 
 app.get('/api/browse/featured-playlists', async (req, res) => {
     try {
-        const playlists = await spotifyAPI.getFeaturedPlaylists(req.sessionID);
+        const playlists = await spotifyAPI.getFeaturedPlaylists(req.session);
         res.json(playlists);
     } catch (error) {
         console.error('Errore nel recuperare le playlist in primo piano:', error.message, error.response?.data);
@@ -391,12 +485,12 @@ app.get('/api/browse/featured-playlists', async (req, res) => {
 // Endpoint per artisti consigliati
 app.get('/api/me/top/artists', async (req, res) => {
     try {
-        const artists = await spotifyAPI.getUserTopArtists(req.sessionID);
+        const artists = await spotifyAPI.getUserTopArtists(req.session);
         res.json(artists);
     } catch (error) {
         console.error('Errore nel recuperare artisti preferiti dell\'utente:', error.message, error.response?.data);
         if (error.response?.status === 401) {
-            spotifyAPI.clearUserTokens(req.sessionID);
+            delete req.session.tokens;
             return res.status(401).json({ error: 'Token Spotify non valido o scaduto. Riprova l\'autenticazione.' });
         }
         res.status(error.response?.status || 500).json({ error: 'Errore interno del server nel recuperare artisti preferiti.' });
@@ -406,12 +500,12 @@ app.get('/api/me/top/artists', async (req, res) => {
 // Endpoint per tracce preferite
 app.get('/api/me/tracks', async (req, res) => {
     try {
-        const tracks = await spotifyAPI.getUserSavedTracks(req.sessionID);
+        const tracks = await spotifyAPI.getUserSavedTracks(req.session);
         res.json(tracks);
     } catch (error) {
         console.error('Errore nel recuperare tracce salvate dell\'utente:', error.message, error.response?.data);
         if (error.response?.status === 401) {
-            spotifyAPI.clearUserTokens(req.sessionID);
+            delete req.session.tokens;
             return res.status(401).json({ error: 'Token Spotify non valido o scaduto. Riprova l\'autenticazione.' });
         }
         res.status(error.response?.status || 500).json({ error: 'Errore interno del server nel recuperare tracce salvate.' });
@@ -438,7 +532,7 @@ app.get('/api/playlists/:playlistId/tracks', async (req, res) => {
     } catch (error) {
         console.error('Errore nel recuperare tracce playlist:', error.message, error.response?.data);
         if (error.response?.status === 401) {
-            spotifyAPI.clearUserTokens(req.sessionID);
+            delete req.session.tokens;
             return res.status(401).json({ error: 'Token Spotify non valido o scaduto. Riprova l\'autenticazione.' });
         }
         res.status(error.response?.status || 500).json({ error: 'Errore interno del server nel recuperare tracce playlist.' });
@@ -469,7 +563,7 @@ app.get('/api/recommendations/playlists', async (req, res) => {
     } catch (error) {
         console.error('Errore nel recuperare raccomandazioni:', error.message, error.response?.data);
         if (error.response?.status === 401) {
-            spotifyAPI.clearUserTokens(req.sessionID);
+            delete req.session.tokens;
             return res.status(401).json({ error: 'Token Spotify non valido o scaduto. Riprova l\'autenticazione.' });
         }
         res.status(error.response?.status || 500).json({ error: 'Errore interno del server nel recuperare raccomandazioni.' });
@@ -478,34 +572,103 @@ app.get('/api/recommendations/playlists', async (req, res) => {
 
 // Endpoint aggregato per i contenuti della Home Page
 app.get('/api/home/content', async (req, res) => {
+    if (!req.session || !req.session.tokens) {
+        return res.status(401).json({ error: 'Autenticazione richiesta per i contenuti della home.' });
+    }
+
     try {
-        const [featuredPlaylists, userTopArtists] = await Promise.all([
-            spotifyAPI.getFeaturedPlaylists(req.sessionID),
-            // Se l'utente è loggato, prendi i suoi artisti top, altrimenti potremmo prendere una classifica globale
-            spotifyAPI.getUserTopArtists(req.sessionID).catch(() => null) 
+        const [
+            userPlaylistsData, 
+            userTopArtistsData,
+            savedAlbumsData,
+            userTopTracksData
+        ] = await Promise.all([
+            spotifyAPI.getUserPlaylists(req.session, { limit: 10 })
+                .catch(e => { console.error('Error playlists:', e); return { playlists: [] }; }),
+            spotifyAPI.getUserTopArtists(req.session, { limit: 10 })
+                .catch(e => { console.error('Error top artists:', e); return []; }),
+            spotifyAPI.getUserSavedAlbums(req.session)
+                .catch(e => { console.error('Error saved albums:', e); return { albums: [] }; }),
+            spotifyAPI.getUserTopTracks(req.session, { limit: 10 })
+                .catch(e => { console.error('Error top tracks:', e); return []; })
         ]);
 
-        const response = {
-            featuredPlaylists: {
-                title: 'Playlist in Evidenza',
-                items: featuredPlaylists || []
-            }
-        };
+        console.log('Dati recuperati:', {
+            playlists: userPlaylistsData?.playlists?.length,
+            topArtists: userTopArtistsData?.length,
+            albums: savedAlbumsData?.albums?.length,
+            topTracks: userTopTracksData?.length
+        });
 
-        if (userTopArtists && userTopArtists.length > 0) {
-            response.topArtists = {
-                title: 'I tuoi Artisti del Momento',
-                items: userTopArtists.map(artist => ({...artist, type: 'artist'}))
+        const response = {};
+
+        if (userPlaylistsData?.playlists?.length > 0) {
+            response.userPlaylists = {
+                title: 'Le tue Playlist',
+                items: userPlaylistsData.playlists
             };
         }
-        
-        // In futuro si possono aggiungere altre sezioni qui (es. Nuove uscite, album popolari)
+
+        if (userTopArtistsData?.length > 0) {
+            response.topArtists = {
+                title: 'I tuoi Artisti del Momento',
+                items: userTopArtistsData
+            };
+        }
+
+        if (savedAlbumsData?.albums?.length > 0) {
+            response.savedAlbums = {
+                title: 'Album Salvati',
+                items: savedAlbumsData.albums
+            };
+        }
+
+        if (userTopTracksData?.length > 0) {
+            response.topTracks = {
+                title: 'Le tue Top Tracce',
+                items: userTopTracksData.map(track => ({
+                    ...track,
+                    type: 'track'
+                }))
+            };
+        }
 
         res.json(response);
 
     } catch (error) {
         console.error('Errore nel recuperare contenuti per la home:', error.message);
         res.status(500).json({ error: 'Errore interno del server nel recuperare i contenuti.' });
+    }
+});
+
+// Endpoint per profilo utente
+app.get('/api/me', async (req, res) => {
+    console.log("req.sessionID", req.sessionID)
+    try {
+        const tokens = await spotifyAPI.getUserTokens(req.session);
+        if (!tokens || !tokens.accessToken) {
+            return res.status(401).json({ error: 'Utente non autenticato o token mancante.' });
+        }
+
+        const userData = await spotifyAPI.getUserProfile(req.session);
+        if (!userData) {
+            return res.status(404).json({ error: 'Profilo utente non trovato.' });
+        }
+
+        // Restituisce i dati nel formato atteso dal frontend
+        res.json({
+            display_name: userData.display_name,
+            email: userData.email,
+            id: userData.id,
+            images: userData.images || []
+        });
+    } catch (error) {
+        console.error('Errore nel recuperare profilo utente:', error.message, error.response?.data);
+        if (error.response?.status === 401) {
+            delete req.session.tokens;
+            return res.status(401).json({ error: 'Token Spotify non valido o scaduto. Riprova l\'autenticazione.' });
+        }
+        res.status(500).json({ error: 'Errore interno del server nel recuperare il profilo utente.' });
     }
 });
 

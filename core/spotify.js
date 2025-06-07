@@ -1,4 +1,3 @@
-import SpotifyWebApi from 'spotify-web-api-node';
 import dotenv from 'dotenv';
 import fetch from 'node-fetch';
 import Redis from 'ioredis';
@@ -7,7 +6,6 @@ dotenv.config();
 
 const SPOTIFY_API_BASE_URL = 'https://api.spotify.com/v1';
 const SPOTIFY_ACCOUNTS_BASE_URL = 'https://accounts.spotify.com/api';
-const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 giorni
 
 export default class SpotifyAPI {
     constructor() {
@@ -15,22 +13,26 @@ export default class SpotifyAPI {
         this.clientSecret = process.env.SPOTIFY_SECRET_ID;
         this.redirectUri = process.env.SPOTIFY_REDIRECT_URI;
         
+        // Questo client Redis è solo per la cache, non per le sessioni.
+        // `connect-redis` gestisce il suo client internamente.
         this.redis = new Redis(process.env.REDIS_URL, {
             maxRetriesPerRequest: 3,
-            enableReadyCheck: false
+            enableReadyCheck: false,
+            enableOfflineQueue: false
         });
 
         this.redis.on('error', (err) => {
-            console.error('Errore connessione Redis:', err);
+            console.error('Errore Redis (per cache):', err);
         });
 
         this.clientCredentialsToken = null;
         this.clientCredentialsTokenExpiresAt = null;
     }
 
-    _getSessionKey(sessionId) {
-        return `session-token:${sessionId}`;
-    }
+    // NON USIAMO PIU' QUESTO. I token sono nella sessione.
+    // _getSessionKey(sessionId) {
+    //     return `session-token:${sessionId}`;
+    // }
 
     async getClientCredentialsToken() {
         if (this.clientCredentialsToken && this.clientCredentialsTokenExpiresAt > Date.now()) {
@@ -38,7 +40,6 @@ export default class SpotifyAPI {
         }
 
         try {
-            console.log('Richiesta nuovo token client credentials...');
             const response = await fetch(`${SPOTIFY_ACCOUNTS_BASE_URL}/token`, {
                 method: 'POST',
                 headers: {
@@ -58,7 +59,6 @@ export default class SpotifyAPI {
             const data = await response.json();
             this.clientCredentialsToken = data.access_token;
             this.clientCredentialsTokenExpiresAt = Date.now() + data.expires_in * 1000;
-            console.log('Nuovo token client credentials ottenuto.');
             return this.clientCredentialsToken;
         } catch (error) {
             console.error('Errore grave nel recupero del token client credentials:', error.message);
@@ -68,7 +68,6 @@ export default class SpotifyAPI {
 
     async exchangeCodeForTokens(code) {
         try {
-            // console.log(`Tentativo di scambiare codice per token... Code: ${code ? code.substring(0,10)+'...\' : "N/D"}`)
             const response = await fetch(`${SPOTIFY_ACCOUNTS_BASE_URL}/token`, {
                 method: 'POST',
                 headers: {
@@ -84,51 +83,42 @@ export default class SpotifyAPI {
 
             if (!response.ok) {
                 const errorBody = await response.json().catch(() => response.text());
-                console.error('Errore nello scambio codice per token:', response.status, errorBody);
                 throw new Error(`Errore HTTP ${response.status} nello scambio codice: ${JSON.stringify(errorBody)}`);
             }
-            const tokenData = await response.json();
-            console.log('Token utente ottenuti con successo tramite codice.');
-            return tokenData;
+            return await response.json();
         } catch (error) {
             console.error('Errore in exchangeCodeForTokens:', error.message);
             throw error;
         }
     }
 
-    async setUserTokens(sessionId, tokenData) {
-        if (!sessionId || !tokenData || !tokenData.access_token) {
-            console.error('setUserTokens: sessionId o tokenData non validi.');
+    async setUserTokens(session, tokenData) {
+        if (!session || !tokenData || !tokenData.access_token) {
+            console.error('setUserTokens: session o tokenData non validi.');
             return;
         }
-        const sessionKey = this._getSessionKey(sessionId);
-        const sessionPayload = {
+        
+        session.tokens = {
             accessToken: tokenData.access_token,
             refreshToken: tokenData.refresh_token,
             expiresAt: Date.now() + (tokenData.expires_in * 1000),
             scope: tokenData.scope
         };
-        await this.redis.set(sessionKey, JSON.stringify(sessionPayload), 'EX', SESSION_TTL_SECONDS);
-        console.log(`Token utente salvati/aggiornati su Redis per sessionID: ${sessionId.substring(0,5)}...`);
+        // Salva la sessione manualmente dopo averla modificata
+        session.save();
+        console.log(`Token utente salvati nella sessione per sessionID: ${session.id.substring(0,6)}...`);
     }
 
-    async refreshUserAccessToken(sessionId) {
-        const sessionKey = this._getSessionKey(sessionId);
-        const sessionDataString = await this.redis.get(sessionKey);
-
-        if (!sessionDataString) {
-             console.warn(`Nessun dato di sessione trovato su Redis per sessionID ${sessionId.substring(0,5)}...`);
-             return null;
-        }
-        const sessionData = JSON.parse(sessionDataString);
-
-        if (!sessionData || !sessionData.refreshToken) {
-            console.warn(`Refresh token non trovato per sessionID ${sessionId.substring(0,5)}... Impossibile refreshare.`);
-            await this.redis.del(sessionKey);
+    async refreshUserAccessToken(session) {
+        if (!session || !session.tokens || !session.tokens.refreshToken) {
+            console.warn(`Refresh token non trovato nella sessione. Impossibile refreshare.`);
+            if(session) delete session.tokens;
             return null;
         }
 
-        console.log(`Tentativo di refresh access token per sessionID: ${sessionId.substring(0,5)}...`);
+        const sessionId = session.id;
+        const refreshToken = session.tokens.refreshToken;
+
         try {
             const response = await fetch(`${SPOTIFY_ACCOUNTS_BASE_URL}/token`, {
                 method: 'POST',
@@ -138,117 +128,62 @@ export default class SpotifyAPI {
                 },
                 body: new URLSearchParams({
                     grant_type: 'refresh_token',
-                    refresh_token: sessionData.refreshToken
+                    refresh_token: refreshToken
                 })
             });
 
             if (!response.ok) {
                 const errorBody = await response.json().catch(() => response.text());
-                console.error(`Errore durante il refresh del token per sessionID ${sessionId.substring(0,5)}...:`, response.status, errorBody);
                 if (response.status === 400 || response.status === 401) {
-                    await this.redis.del(sessionKey);
+                    delete session.tokens;
+                    session.save();
                 }
                 throw new Error(`Errore HTTP ${response.status} durante il refresh del token: ${JSON.stringify(errorBody)}`);
             }
 
             const newTokenData = await response.json();
-            const newRefreshToken = newTokenData.refresh_token || sessionData.refreshToken;
+            const newRefreshToken = newTokenData.refresh_token || refreshToken;
             
-            await this.setUserTokens(sessionId, {
+            await this.setUserTokens(session, {
                 ...newTokenData,
                 refresh_token: newRefreshToken
             });
 
-            const updatedSessionString = await this.redis.get(sessionKey);
-            const updatedSessionData = JSON.parse(updatedSessionString);
-
-            console.log(`Access token refreshato con successo per sessionID: ${sessionId.substring(0,5)}...`);
-            return updatedSessionData.accessToken;
+            return session.tokens.accessToken;
         } catch (error) {
-            console.error(`Errore grave durante il refresh del token per sessionID ${sessionId.substring(0,5)}...:`, error.message);
+            console.error(`Errore grave durante il refresh del token per sessionID ${sessionId.substring(0,6)}...:`, error.message);
             throw error;
         }
     }
 
-    async getUserTokens(sessionId) {
-        if (!sessionId) {
+    async getUserTokens(session) {
+        if (!session || !session.tokens) {
             return null;
         }
-        const sessionKey = this._getSessionKey(sessionId);
-        const sessionDataString = await this.redis.get(sessionKey);
-
-        if (!sessionDataString) {
-            return null;
-        }
-
-        let sessionData = JSON.parse(sessionDataString);
         
-        if (sessionData.expiresAt <= Date.now() + 60000) { // 60 secondi di margine
+        const { tokens } = session;
+        
+        if (tokens.expiresAt <= Date.now() + 60000) { // 60 secondi di margine
             try {
-                const newAccessToken = await this.refreshUserAccessToken(sessionId);
+                const newAccessToken = await this.refreshUserAccessToken(session);
                 if (!newAccessToken) return null;
-
-                const updatedSessionString = await this.redis.get(sessionKey);
-                sessionData = JSON.parse(updatedSessionString);
-
+                return session.tokens;
             } catch (refreshError) {
-                console.error(`getUserTokens: Fallito il refresh per sessionID ${sessionId.substring(0,5)}...`, refreshError.message);
+                console.error(`getUserTokens: Fallito il refresh per sessionID ${session.id.substring(0,6)}...`, refreshError.message);
                 return null;
             }
         }
-        return {
-            access_token: sessionData.accessToken,
-            refresh_token: sessionData.refreshToken,
-        };
+        return tokens;
     }
 
-    async clearUserTokens(sessionId) {
-        const sessionKey = this._getSessionKey(sessionId);
-        const result = await this.redis.del(sessionKey);
-        if (result > 0) {
-            console.log(`Token utente rimossi da Redis per sessionID: ${sessionId.substring(0,5)}...`);
-        }
-    }
-
-    async _getWithCache(key, fetcher, ttlSeconds = 3600) { // Default TTL 1 ora
-        try {
-            const cachedData = await this.redis.get(key);
-            if (cachedData) {
-                console.log(`[CACHE HIT] Key: ${key}`);
-                return JSON.parse(cachedData);
-            }
-        } catch (error) {
-            console.error(`[CACHE ERROR] Errore lettura da Redis per key ${key}:`, error);
-        }
-
-        console.log(`[CACHE MISS] Key: ${key}`);
-        const freshData = await fetcher();
-        
-        if (freshData) {
-            try {
-                // Non cachare risposte di errore esplicite
-                if (freshData.success === false) return freshData;
-                
-                await this.redis.set(key, JSON.stringify(freshData), 'EX', ttlSeconds);
-            } catch (error) {
-                 console.error(`[CACHE ERROR] Errore scrittura su Redis per key ${key}:`, error);
-            }
-        }
-       
-        return freshData;
-    }
-
-    async _makeApiRequest(sessionId, endpoint, method = 'GET', body = null) {
+    async _makeApiRequest(session, endpoint, method = 'GET', body = null) {
         let accessToken;
-        if (sessionId) {
-            const userTokens = await this.getUserTokens(sessionId);
-            if (userTokens && userTokens.access_token) {
-                accessToken = userTokens.access_token;
-            } else {
-                console.warn(`_makeApiRequest: Nessun token utente valido per sessionID ${sessionId.substring(0,5)}... per endpoint ${endpoint}`);
-            }
+        if (session && session.tokens) {
+            const userTokens = await this.getUserTokens(session);
+            accessToken = userTokens ? userTokens.accessToken : null;
         }
 
+        // Se non c'è un token utente, usa il token client (per ricerche pubbliche etc.)
         if (!accessToken) {
             try {
                 accessToken = await this.getClientCredentialsToken();
@@ -257,10 +192,6 @@ export default class SpotifyAPI {
             }
         }
         
-        if (!accessToken) {
-            throw new Error('Nessun access token (utente o client) disponibile per la richiesta API.');
-        }
-
         const headers = {
             'Authorization': `Bearer ${accessToken}`,
             'Content-Type': 'application/json'
@@ -273,11 +204,9 @@ export default class SpotifyAPI {
         try {
             const response = await fetch(`${SPOTIFY_API_BASE_URL}${endpoint}`, config);
             if (!response.ok) {
-                const errorBody = await response.json().catch(() => ({ message: response.statusText, status: response.status }));
-                console.error(`Errore API Spotify (${response.status}) per ${method} ${endpoint}:`, errorBody);
+                const errorBody = await response.json().catch(() => ({ message: response.statusText }));
                 const err = new Error(errorBody.error?.message || errorBody.message || `Errore API ${response.status}`);
                 err.status = errorBody.error?.status || response.status;
-                err.response = { data: errorBody };
                 throw err;
             }
             if (response.status === 204 || response.headers.get('content-length') === '0') {
@@ -285,28 +214,29 @@ export default class SpotifyAPI {
             }
             return await response.json();
         } catch (error) {
-            console.error(`Catch in _makeApiRequest per ${method} ${endpoint}:`, error.message);
             throw error;
         }
     }
 
-    async getUserProfile(sessionId) {
-        if (!sessionId) throw new Error('SessionId richiesto per getUserProfile');
-        const userTokens = await this.getUserTokens(sessionId);
-        if (!userTokens || !userTokens.access_token) {
-            throw { status: 401, message: 'Utente non autenticato o token mancante/scaduto per getUserProfile.', response: { data: { error: { status: 401, message: 'Token non valido'}} }};
+    async getUserProfile(session) {
+        const userTokens = await this.getUserTokens(session);
+        if (!userTokens) {
+            const error = new Error('Utente non autenticato o token mancante/scaduto.');
+            error.status = 401;
+            throw error;
         }
-        return this._makeApiRequest(sessionId, '/me');
+        return this._makeApiRequest(session, '/me');
     }
 
-    async getUserPlaylists(sessionId, options = { limit: 20, offset: 0 }) {
-        if (!sessionId) throw new Error('SessionId richiesto per getUserPlaylists');
-        const userTokens = await this.getUserTokens(sessionId);
-        if (!userTokens || !userTokens.access_token) {
-             throw { status: 401, message: 'Utente non autenticato o token mancante/scaduto per getUserPlaylists.', response: { data: { error: { status: 401, message: 'Token non valido'}} }};
+    async getUserPlaylists(session, options = { limit: 20, offset: 0 }) {
+        const userTokens = await this.getUserTokens(session);
+        if (!userTokens) {
+            const error = new Error('Utente non autenticato o token mancante/scaduto.');
+            error.status = 401;
+            throw error;
         }
         const params = new URLSearchParams(options).toString();
-        const data = await this._makeApiRequest(sessionId, `/me/playlists?${params}`);
+        const data = await this._makeApiRequest(session, `/me/playlists?${params}`);
         return data.items.map(p => ({
             id: p.id,
             name: p.name,
@@ -320,11 +250,11 @@ export default class SpotifyAPI {
         }));
     }
 
-    async getFeaturedPlaylists(sessionId, options = { limit: 20, offset: 0 }) {
+    async getFeaturedPlaylists(session, options = { limit: 20, offset: 0 }) {
         const cacheKey = `cache:featured-playlists:limit=${options.limit}:offset=${options.offset}`;
         const fetcher = async () => {
             const params = new URLSearchParams(options).toString();
-            const data = await this._makeApiRequest(sessionId, `/browse/featured-playlists?${params}`);
+            const data = await this._makeApiRequest(session, `/browse/featured-playlists?${params}`);
             return data.playlists.items.map(p => ({
                 id: p.id,
                 name: p.name,
@@ -402,6 +332,23 @@ export default class SpotifyAPI {
             return { 
                 success: false, 
                 message: error.message || "Errore durante la ricerca tracce",
+                error: { message: error.message, status: error.status }
+            };
+        }
+    }
+
+    async searchAlbum(query, limit = 10) {
+        try {
+            const data = await this._makeApiRequest(null, `/search?q=${encodeURIComponent(query)}&type=album&market=IT&limit=${limit}`);
+            return data.albums.items.map(album => ({
+                id: album.id,
+                name: album.name,
+            }));
+        } catch (error) {
+            console.error('Errore nella ricerca album (SpotifyAPI):', error.message, error.status);
+            return { 
+                success: false, 
+                message: error.message || "Errore durante la ricerca album",
                 error: { message: error.message, status: error.status }
             };
         }
@@ -624,22 +571,22 @@ export default class SpotifyAPI {
         }
     }
 
-    async getUserTopArtists(sessionId, options = { limit: 10, time_range: 'medium_term' }) {
-        if (!sessionId) throw new Error('SessionId richiesto per getUserTopArtists');
+    async getUserTopArtists(session, options = { limit: 10, time_range: 'medium_term' }) {
+        if (!session || !session.id) throw new Error('Sessione richiesta per getUserTopArtists');
         
         // La cache per i dati utente deve essere specifica per l'utente
-        const user = await this.getUserProfile(sessionId);
+        const user = await this.getUserProfile(session);
         if(!user || !user.id) throw new Error('Impossibile ottenere il profilo utente per la chiave di cache.');
 
         const cacheKey = `cache:user:${user.id}:top-artists:limit=${options.limit}:range=${options.time_range}`;
         
         const fetcher = async () => {
-            const userTokens = await this.getUserTokens(sessionId);
-            if (!userTokens || !userTokens.access_token) {
+            const userTokens = await this.getUserTokens(session);
+            if (!userTokens || !userTokens.accessToken) {
                 throw { status: 401, message: 'Utente non autenticato o token mancante/scaduto per getUserTopArtists.', response: { data: { error: { status: 401, message: 'Token non valido'}} }};
             }
             const params = new URLSearchParams(options).toString();
-            const data = await this._makeApiRequest(sessionId, `/me/top/artists?${params}`);
+            const data = await this._makeApiRequest(session, `/me/top/artists?${params}`);
             return data.items.map(artist => ({
                 id: artist.id,
                 name: artist.name,
@@ -654,16 +601,16 @@ export default class SpotifyAPI {
         return this._getWithCache(cacheKey, fetcher, 6 * 3600); // Cache per 6 ore
     }
 
-    async getUserSavedTracks(sessionId, options = { limit: 20, offset: 0 }) {
-        if (!sessionId) throw new Error('SessionId richiesto per getUserSavedTracks');
+    async getUserSavedTracks(session, options = { limit: 20, offset: 0 }) {
+        if (!session || !session.id) throw new Error('Sessione richiesta per getUserSavedTracks');
         // NOTA: Le tracce salvate cambiano spesso, la cache qui dovrebbe essere molto breve o invalidata aggressivamente.
         // Per ora, non la implementiamo per evitare dati stantii.
-        const userTokens = await this.getUserTokens(sessionId);
-        if (!userTokens || !userTokens.access_token) {
+        const userTokens = await this.getUserTokens(session);
+        if (!userTokens || !userTokens.accessToken) {
             throw { status: 401, message: 'Utente non autenticato o token mancante/scaduto per getUserSavedTracks.', response: { data: { error: { status: 401, message: 'Token non valido'}} }};
         }
         const params = new URLSearchParams(options).toString();
-        const data = await this._makeApiRequest(sessionId, `/me/tracks?${params}`);
+        const data = await this._makeApiRequest(session, `/me/tracks?${params}`);
         return {
             items: data.items.map(item => ({
                 added_at: item.added_at,
@@ -681,6 +628,45 @@ export default class SpotifyAPI {
             limit: data.limit,
             offset: data.offset
         };
+    }
+
+    async getUserSavedAlbums(session, options = { limit: 20, offset: 0 }) {
+        if (!session) return null;
+
+        // Converti i valori in numeri
+        const limit = Number(options.limit) || 20;
+        const offset = Number(options.offset) || 0;
+
+        const fetcher = async () => {
+            const params = new URLSearchParams({
+                limit: limit.toString(),
+                offset: offset.toString()
+            }).toString();
+            
+            const data = await this._makeApiRequest(session, `/me/albums?${params}`);
+            if (!data || !data.items) return { albums: [] };
+
+            const albums = data.items.map(item => {
+                const album = item.album;
+                return {
+                    spotify_id: album.id,
+                    name: album.name,
+                    artist: album.artists.map(a => a.name).join(', '),
+                    image: album.images.length > 0 ? album.images[0].url : undefined,
+                    release_date: album.release_date,
+                    total_tracks: album.total_tracks,
+                };
+            });
+            return { albums };
+        };
+
+        try {
+            const data = await fetcher();
+            return { success: true, ...data };
+        } catch (error) {
+            console.error('Errore nel recuperare gli album salvati:', error.message);
+            return { albums: [] };
+        }
     }
 
     // Nuovo metodo per ottenere dettagli artista
@@ -879,6 +865,168 @@ export default class SpotifyAPI {
             };
         }
     }
+
+    async unifiedSearch(query, types = ['track', 'album', 'artist', 'playlist'], limit = 10) {
+        try {
+            const typeParam = types.join(',');
+            const data = await this._makeApiRequest(
+                null, 
+                `/search?q=${encodeURIComponent(query)}&type=${typeParam}&market=IT&limit=${limit}`
+            );
+
+            const results = {};
+
+            // Elaborazione tracce
+            if (data.tracks && types.includes('track')) {
+                results.tracks = this._processTracks(data.tracks.items);
+            }
+
+            // Elaborazione album
+            if (data.albums && types.includes('album')) {
+                results.albums = data.albums.items.map(album => ({
+                    id: album.id,
+                    name: album.name,
+                    artists: album.artists.map(artist => artist.name),
+                    image: album.images[0]?.url,
+                    release_date: album.release_date
+                }));
+            }
+
+            // Elaborazione artisti
+            if (data.artists && types.includes('artist')) {
+                results.artists = data.artists.items.map(artist => ({
+                    id: artist.id,
+                    name: artist.name,
+                    genres: artist.genres,
+                    image: artist.images[0]?.url,
+                    popularity: artist.popularity
+                }));
+            }
+
+            // Elaborazione playlist
+            if (data.playlists && types.includes('playlist')) {
+                results.playlists = data.playlists.items.map(playlist => ({
+                    id: playlist.id,
+                    name: playlist.name,
+                    description: playlist.description,
+                    image: playlist.images[0]?.url,
+                    owner: playlist.owner.display_name
+                }));
+            }
+
+            return {
+                success: true,
+                results
+            };
+
+        } catch (error) {
+            console.error('Errore ricerca unificata:', error);
+            return {
+                success: false,
+                message: error.message || "Errore durante la ricerca",
+                error: { message: error.message, status: error.status }
+            };
+        }
+    }
+
+    _processTracks(tracks) {
+        const groupedTracks = new Map();
+        
+        tracks.forEach(track => {
+            const key = `${track.name.toLowerCase()}|${track.artists[0]?.name.toLowerCase()}`;
+            if (!groupedTracks.has(key)) {
+                groupedTracks.set(key, []);
+            }
+            groupedTracks.get(key).push(track);
+        });
+
+        return Array.from(groupedTracks.values()).map(trackGroup => {
+            const representative = this._selectRepresentativeTrack(trackGroup);
+            return {
+                name: representative.name,
+                artist: representative.artists.map(a => a.name).join(', '),
+                album: representative.album.name,
+                image: representative.album.images[0]?.url,
+                duration: representative.duration_ms,
+                spotify_id: representative.id
+            };
+        });
+    }
+
+    _selectRepresentativeTrack(trackGroup) {
+        if (trackGroup.length === 1) return trackGroup[0];
+        
+        const durations = trackGroup.map(t => t.duration_ms).sort((a, b) => a - b);
+        const mid = Math.floor(durations.length / 2);
+        const medianDuration = durations.length % 2 === 0 ? 
+            (durations[mid - 1] + durations[mid]) / 2 : 
+            durations[mid];
+
+        let closestTrack = trackGroup[0];
+        let minDiff = Infinity;
+
+        trackGroup.forEach(track => {
+            const diff = Math.abs(track.duration_ms - medianDuration);
+            if (diff < minDiff) {
+                minDiff = diff;
+                closestTrack = track;
+            }
+        });
+
+        return closestTrack;
+    }
+
+    async _getWithCache(cacheKey, fetcher, ttlSeconds = 3600) {
+        try {
+            // Prova a recuperare dalla cache
+            const cachedData = await this.redis.get(cacheKey);
+            if (cachedData) {
+                return JSON.parse(cachedData);
+            }
+
+            // Se non in cache, esegui la fetcher function
+            const freshData = await fetcher();
+            
+            // Salva in cache con TTL
+            await this.redis.set(
+                cacheKey, 
+                JSON.stringify(freshData),
+                'EX', 
+                ttlSeconds
+            );
+
+            return freshData;
+        } catch (error) {
+            console.error(`Errore nella cache per chiave ${cacheKey}:`, error);
+            // Fallback: esegui la fetcher senza cache
+            return fetcher();
+        }
+    }
+
+    async getUserTopTracks(session, options = { limit: 10, time_range: 'medium_term' }) {
+        if (!session || !session.id) throw new Error('Sessione richiesta per getUserTopTracks');
+        
+        const user = await this.getUserProfile(session);
+        const cacheKey = `cache:user:${user.id}:top-tracks:limit=${options.limit}:range=${options.time_range}`;
+        
+        const fetcher = async () => {
+            const params = new URLSearchParams(options).toString();
+            const data = await this._makeApiRequest(session, `/me/top/tracks?${params}`);
+            
+            return data.items.map(track => ({
+                spotify_id: track.id,
+                name: track.name,
+                artist: track.artists.map(artist => artist.name).join(', '),
+                album: track.album.name,
+                image: track.album.images[0]?.url,
+                duration: track.duration_ms,
+                popularity: track.popularity,
+                preview_url: track.preview_url
+            }));
+        };
+
+        return this._getWithCache(cacheKey, fetcher, 6 * 3600); // Cache per 6 ore
+    }
 }
 
 // // Test della classe
@@ -899,6 +1047,14 @@ export default class SpotifyAPI {
 //     const result = await spotifyAPI.searchTrack("gimme more Britney Spears");
 //     if (result.success) {
 //         console.log("Risultato della ricerca:");
+//         console.log(JSON.stringify(result.data, null, 2));
+//     }
+// })();
+
+//         console.log(JSON.stringify(result.data, null, 2));
+//     }
+// })();
+
 //         console.log(JSON.stringify(result.data, null, 2));
 //     }
 // })();
